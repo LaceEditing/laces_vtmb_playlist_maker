@@ -15,6 +15,7 @@ def get_ffmpeg_path():
     """
     Get the path to FFmpeg executable.
     Handles both development and bundled (PyInstaller) environments.
+    Returns tuple: (ffmpeg_path or None, error_message or None)
     """
     # Check if we're running as a bundled executable
     if getattr(sys, 'frozen', False):
@@ -34,11 +35,57 @@ def get_ffmpeg_path():
             AudioSegment.converter = ffmpeg_path
             AudioSegment.ffmpeg = ffmpeg_path
             AudioSegment.ffprobe = ffprobe_path
-            return ffmpeg_path
+            return ffmpeg_path, None
+        else:
+            return None, f"FFMPEG not found in bundle at: {ffmpeg_path}"
 
-    # Running in development mode or FFmpeg is in PATH
-    # AudioSegment will use system FFmpeg
-    return None
+    # Running in development mode - check if FFmpeg is in PATH
+    import shutil
+    ffmpeg_in_path = shutil.which('ffmpeg')
+    if ffmpeg_in_path:
+        return ffmpeg_in_path, None
+    else:
+        return None, "FFMPEG not found in system PATH. Please install FFMPEG or ensure it's in your PATH."
+
+
+def validate_ffmpeg():
+    """
+    Validate that FFMPEG is available and working.
+    Returns tuple: (is_valid: bool, error_message: str or None)
+    """
+    ffmpeg_path, error = get_ffmpeg_path()
+
+    if error:
+        return False, error
+
+    # Try to verify FFMPEG works by checking version
+    try:
+        import subprocess
+        if ffmpeg_path:
+            result = subprocess.run([ffmpeg_path, '-version'],
+                                  capture_output=True,
+                                  timeout=5,
+                                  creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
+            if result.returncode == 0:
+                return True, None
+            else:
+                return False, f"FFMPEG found but not working properly (exit code: {result.returncode})"
+        else:
+            # No explicit path, try system ffmpeg
+            result = subprocess.run(['ffmpeg', '-version'],
+                                  capture_output=True,
+                                  timeout=5,
+                                  creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
+            if result.returncode == 0:
+                return True, None
+            else:
+                return False, f"FFMPEG found in PATH but not working properly"
+    except FileNotFoundError:
+        return False, "FFMPEG executable not found. Please install FFMPEG."
+    except subprocess.TimeoutExpired:
+        return False, "FFMPEG validation timed out."
+    except Exception as e:
+        return False, f"Error validating FFMPEG: {str(e)}"
 
 
 # Initialize FFmpeg path on module load
@@ -66,7 +113,7 @@ class AudioProcessor:
         return ext in self.supported_formats
 
     def create_playlist_audio(self, playlist: Playlist, output_path: str,
-                            target_duration: int = None, original_file_path: str = None) -> bool:
+                            target_duration: int = None, original_file_path: str = None):
         """
         Create a single audio file from playlist
 
@@ -77,11 +124,12 @@ class AudioProcessor:
             original_file_path: Path to original game file to match audio properties
 
         Returns:
-            True if successful, False otherwise
+            Tuple of (success: bool, error_message: str or None)
         """
         if not playlist.audio_files:
-            print(f"Playlist '{playlist.name}' has no audio files")
-            return False
+            error_msg = f"Playlist '{playlist.name}' has no audio files"
+            print(error_msg)
+            return False, error_msg
 
         try:
             # Prepare audio segments and normalize sample rates
@@ -158,8 +206,9 @@ class AudioProcessor:
                     continue
 
             if not audio_segments:
-                print("No valid audio files to process")
-                return False
+                error_msg = "No valid audio files to process - all files failed to load"
+                print(error_msg)
+                return False, error_msg
 
             # Generate playlist based on playback mode
             final_audio = self._generate_audio_sequence(
@@ -190,13 +239,17 @@ class AudioProcessor:
             final_audio.export(output_path, **export_params)
             print(f"Successfully created: {output_path}")
 
-            return True
+            return True, None
 
         except Exception as e:
-            print(f"Error creating playlist audio: {e}")
+            error_msg = f"Error creating playlist audio: {str(e)}"
+            print(error_msg)
             import traceback
             traceback.print_exc()
-            return False
+            # Check if it's an FFMPEG-related error
+            if 'ffmpeg' in str(e).lower() or 'ffprobe' in str(e).lower():
+                error_msg += "\n\nThis appears to be an FFMPEG-related error. Please ensure FFMPEG is properly installed and bundled."
+            return False, error_msg
 
     def _generate_audio_sequence(self, segments: List[AudioSegment],
                                  playback_mode: str,
