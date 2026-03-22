@@ -13,7 +13,7 @@ import customtkinter as ctk
 import pygame
 from PIL import Image, ImageTk
 
-from src.audio_processor import AudioProcessor, validate_ffmpeg
+from src.audio_processor import AudioProcessor, check_ffmpeg_available, is_ffmpeg_available
 from src.game_file_manager import GameFileManager
 from src.models import AppConfig, Playlist, AudioFile, PlaybackMode, LocationType
 from src.utils import find_vtmb_installation, get_music_info, get_music_directories, get_all_locations, SUPPORTED_AUDIO_FORMATS
@@ -160,7 +160,8 @@ def apply_app_icon(window):
 
 
 def finalize_modal(window, min_width: int = 0, min_height: int = 0):
-    """Ensure modal windows have enough space to display content."""
+    """Ensure modal windows have enough space to display content,
+    capped to screen bounds with DPI scaling awareness."""
     try:
         window.update_idletasks()
         preferred_width = window.winfo_reqwidth() + 20
@@ -169,8 +170,38 @@ def finalize_modal(window, min_width: int = 0, min_height: int = 0):
         width = max(min_width, preferred_width)
         height = max(min_height, preferred_height)
 
-        window.minsize(width, height)
-        window.geometry(f"{width}x{height}")
+        # Get DPI scaling factor (CustomTkinter scales widgets automatically,
+        # but screen dimensions from tkinter are in physical pixels)
+        try:
+            scaling = window._get_window_scaling()
+        except Exception:
+            scaling = 1.0
+
+        # Cap to 90% of available screen size (accounting for taskbar)
+        screen_w = window.winfo_screenwidth()
+        screen_h = window.winfo_screenheight()
+        max_w = int(screen_w * 0.9 / scaling)
+        max_h = int(screen_h * 0.9 / scaling)
+
+        width = min(width, max_w)
+        height = min(height, max_h)
+
+        # Set minimum size (also capped to screen)
+        capped_min_w = min(min_width, max_w) if min_width else width
+        capped_min_h = min(min_height, max_h) if min_height else height
+        window.minsize(capped_min_w, capped_min_h)
+
+        # Center on screen
+        x = max(0, (screen_w - int(width * scaling)) // 2)
+        y = max(0, (screen_h - int(height * scaling)) // 2)
+        window.geometry(f"{width}x{height}+{x}+{y}")
+
+        # Prevent minimize on modal dialogs — restores window if minimized
+        def _on_unmap(event):
+            if event.widget is window:
+                window.after(100, lambda: window.deiconify() if window.winfo_exists() else None)
+
+        window.bind("<Unmap>", _on_unmap)
     except Exception:
         pass
 
@@ -303,9 +334,34 @@ class PlaylistEditorDialog(ctk.CTkToplevel):
         finalize_modal(self, min_width=720, min_height=620)
 
     def setup_ui(self):
-        # Main container
-        main_frame = ctk.CTkFrame(self, fg_color=self.colors['bg_dark'])
-        main_frame.pack(fill="both", expand=True, padx=20, pady=20)
+        # Bottom buttons — pinned outside scroll area so always reachable
+        btn_frame = ctk.CTkFrame(self, fg_color=self.colors['bg_dark'])
+        btn_frame.pack(side="bottom", fill="x", padx=20, pady=(0, 20))
+
+        ctk.CTkButton(
+            btn_frame,
+            text="Cancel",
+            command=self.cancel,
+            fg_color=self.colors['bg_medium'],
+            hover_color=self.colors['accent'],
+            text_color=self.colors['text'],
+            width=100
+        ).pack(side="right", padx=5)
+
+        ctk.CTkButton(
+            btn_frame,
+            text="💾 Save",
+            command=self.save,
+            fg_color=self.colors['secondary'],
+            hover_color=self.colors['accent'],
+            text_color=self.colors['text'],
+            width=100,
+            font=ctk.CTkFont(weight="bold")
+        ).pack(side="right", padx=5)
+
+        # Scrollable main content area
+        main_frame = ctk.CTkScrollableFrame(self, fg_color=self.colors['bg_dark'])
+        main_frame.pack(fill="both", expand=True, padx=20, pady=(20, 10))
 
         # Playlist name
         ctk.CTkLabel(
@@ -498,31 +554,6 @@ class PlaylistEditorDialog(ctk.CTkToplevel):
             text_color=self.colors['text']
         ).pack(side="left", padx=5)
 
-        # Bottom buttons
-        btn_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
-        btn_frame.pack(fill="x", pady=(10, 0))
-
-        ctk.CTkButton(
-            btn_frame,
-            text="Cancel",
-            command=self.cancel,
-            fg_color=self.colors['bg_medium'],
-            hover_color=self.colors['accent'],
-            text_color=self.colors['text'],
-            width=100
-        ).pack(side="right", padx=5)
-
-        ctk.CTkButton(
-            btn_frame,
-            text="💾 Save",
-            command=self.save,
-            fg_color=self.colors['secondary'],
-            hover_color=self.colors['accent'],
-            text_color=self.colors['text'],
-            width=100,
-            font=ctk.CTkFont(weight="bold")
-        ).pack(side="right", padx=5)
-
     def browse_game_file(self):
         """Browse for game files with context about where they play"""
         if not self.game_manager or not self.game_manager.game_directory:
@@ -688,7 +719,12 @@ class PlaylistEditorDialog(ctk.CTkToplevel):
                 display_name = os.path.basename(filename)
                 self.audio_listbox.insert(tk.END, f"{display_name} | {filename}")
             else:
-                messagebox.showerror("Invalid File", f"Could not add {filename}:\n{error}")
+                # Show user-friendly error with the filename
+                display_name = os.path.basename(filename)
+                messagebox.showerror(
+                    "Could Not Add File",
+                    f"Could not add \"{display_name}\":\n\n{error}"
+                )
 
     def add_from_library(self):
         """Add files from the audio library"""
@@ -905,15 +941,15 @@ class VTMBPlaylistMakerApp(ctk.CTk):
         self._resize_timer = None
         self.bind("<Configure>", self._on_resize)
 
-        # Validate FFMPEG availability on startup
-        self.after(100, self._validate_ffmpeg_on_startup)
-
         # Auto-detect game directory on first launch
         if not self.config.game_directory:
             self.auto_detect_game_directory()
         else:
             # Auto-scan on launch if game directory is set
             self.after(500, self.scan_game_tracks)  # Delay to let UI load first
+
+        # Check FFmpeg availability after UI is ready
+        self.after(200, self._check_ffmpeg)
 
     def _on_resize(self, event):
         """Handle window resize with debouncing for better performance"""
@@ -934,17 +970,15 @@ class VTMBPlaylistMakerApp(ctk.CTk):
         # Force geometry update
         self.update_idletasks()
 
-    def _validate_ffmpeg_on_startup(self):
-        """Validate FFMPEG availability and show warning if missing"""
-        is_valid, error_msg = validate_ffmpeg()
-        if not is_valid:
+    def _check_ffmpeg(self):
+        """Check FFmpeg availability and warn user if missing."""
+        available, message = check_ffmpeg_available()
+        if not available:
             messagebox.showwarning(
-                "FFMPEG Not Available",
-                f"{error_msg}\n\n"
-                "You can still use the application to browse and preview tracks, "
-                "but you will not be able to generate playlist audio files until FFMPEG is installed.\n\n"
-                "For PyInstaller builds: Ensure ffmpeg is bundled in the 'ffmpeg/bin/' directory.\n"
-                "For development: Install FFMPEG and ensure it's in your system PATH."
+                "FFmpeg Not Found",
+                f"{message}\n\n"
+                "Without FFmpeg, you won't be able to add audio files or create playlists.\n"
+                "If you're using the standalone .exe, your antivirus may have quarantined FFmpeg."
             )
 
     def _setup_vampire_theme(self):
@@ -1099,7 +1133,7 @@ class VTMBPlaylistMakerApp(ctk.CTk):
         )
         self.filter_dropdown.pack(side="left", padx=5)
 
-        self.scan_button = ctk.CTkButton(
+        ctk.CTkButton(
             location_header,
             text="🔍 Scan Game Files",
             command=self.scan_game_tracks,
@@ -1107,8 +1141,7 @@ class VTMBPlaylistMakerApp(ctk.CTk):
             fg_color=self.colors['accent'],
             hover_color=self.colors['secondary'],
             text_color=self.colors['text']
-        )
-        self.scan_button.pack(side="left", padx=10)
+        ).pack(side="left", padx=10)
 
         # Main split view
         main_view = ctk.CTkFrame(content, fg_color="transparent")
@@ -1337,15 +1370,10 @@ class VTMBPlaylistMakerApp(ctk.CTk):
         self.update_progress()
 
     def scan_game_tracks(self):
-        """Scan game directory for all music tracks (starts background thread)"""
+        """Scan game directory for all music tracks"""
         if not self.config.game_directory:
             messagebox.showwarning("No Game Directory",
                                  "Please set the game directory in Settings first.")
-            return
-
-        # Check if already scanning
-        if hasattr(self, '_is_scanning') and self._is_scanning:
-            messagebox.showinfo("Scan In Progress", "A scan is already in progress. Please wait...")
             return
 
         # Stop any playing audio before scanning to prevent file locks
@@ -1357,43 +1385,28 @@ class VTMBPlaylistMakerApp(ctk.CTk):
                 self.is_playing = False
                 if hasattr(self, 'play_pause_btn'):
                     self.play_pause_btn.configure(text="▶")
-            except:
+            except Exception:
                 pass
 
-        # Start scanning in background thread
-        self._is_scanning = True
-        if hasattr(self, 'scan_button'):
-            self.scan_button.configure(state="disabled", text="⏳ Scanning...")
-        self._scan_progress_dialog = ScanProgressDialog(self, colors=self.colors)
-        thread = threading.Thread(target=self._scan_game_tracks_thread, daemon=True)
-        thread.start()
-
-    def _scan_game_tracks_thread(self):
-        """Background thread for scanning game tracks"""
-        import time
-
         # Give Windows time to release file handles
+        import time
         time.sleep(0.2)
 
+        # Get music directories
+        music_dirs = get_music_directories(self.config.game_directory)
+        if not music_dirs:
+            messagebox.showwarning("No Music Directories",
+                                 "No music directories found. Make sure the Unofficial Patch is installed.")
+            return
+
+        progress_dialog = ScanProgressDialog(self, colors=self.colors)
+        progress_dialog.update_status("Scanning music directories...")
+        self.update_idletasks()
+
+        tracks_by_path: dict[str, dict] = {}
+        radio_segments_added = 0
+
         try:
-            # Get music directories
-            music_dirs = get_music_directories(self.config.game_directory)
-            if not music_dirs:
-                def _show_warning():
-                    messagebox.showwarning("No Music Directories",
-                                         "No music directories found. Make sure the Unofficial Patch is installed.")
-                    self._scan_progress_dialog.close()
-                    self._is_scanning = False
-                    if hasattr(self, 'scan_button'):
-                        self.scan_button.configure(state="normal", text="🔍 Scan Game Files")
-                self.after(0, _show_warning)
-                return
-
-            self._scan_progress_dialog.update_status("Scanning music directories...")
-
-            tracks_by_path: dict[str, dict] = {}
-            radio_segments_added = 0
-
             # Collect all audio files
             for music_dir in music_dirs:
                 dir_path = music_dir['path']
@@ -1406,7 +1419,7 @@ class VTMBPlaylistMakerApp(ctk.CTk):
                     except ValueError:
                         # Fallback if paths are on different drives
                         display_path = dir_path
-                self._scan_progress_dialog.update_status(f"Scanning {display_path}...")
+                progress_dialog.update_status(f"Scanning {display_path}...")
 
                 for root, dirs, files in os.walk(dir_path):
                     for file in files:
@@ -1463,7 +1476,7 @@ class VTMBPlaylistMakerApp(ctk.CTk):
                             radio_display = os.path.relpath(music_dir['path'], self.config.game_directory)
                         except ValueError:
                             radio_display = music_dir['path']
-                    self._scan_progress_dialog.update_status(f"Analyzing {radio_display}...")
+                    progress_dialog.update_status(f"Analyzing {radio_display}...")
                     segments = self.radio_segment_manager.scan_radio_loops(music_dir['path'])
 
                     for segment in segments:
@@ -1517,36 +1530,21 @@ class VTMBPlaylistMakerApp(ctk.CTk):
             total_tracks = len(self.game_tracks)
             regular_tracks = total_tracks - radio_segments_added
 
-            # Schedule UI updates on main thread
-            def _complete_scan():
-                self._scan_progress_dialog.close()
-                self._is_scanning = False
-                if hasattr(self, 'scan_button'):
-                    self.scan_button.configure(state="normal", text="🔍 Scan Game Files")
+            progress_dialog.close()
+            progress_dialog = None
 
-                messagebox.showinfo(
-                    "Scan Complete",
-                    f"Found {regular_tracks} music tracks + {radio_segments_added} radio segments\n"
-                    f"Total: {total_tracks} editable tracks in the game directory."
-                )
+            messagebox.showinfo(
+                "Scan Complete",
+                f"Found {regular_tracks} music tracks + {radio_segments_added} radio segments\n"
+                f"Total: {total_tracks} editable tracks in the game directory."
+            )
+        finally:
+            if progress_dialog:
+                progress_dialog.close()
 
-                self.update_location_dropdown()
-                self.refresh_tracks()
-
-            self.after(0, _complete_scan)
-
-        except Exception as e:
-            # Handle any errors during scan
-            def _show_error():
-                self._scan_progress_dialog.close()
-                self._is_scanning = False
-                if hasattr(self, 'scan_button'):
-                    self.scan_button.configure(state="normal", text="🔍 Scan Game Files")
-                messagebox.showerror(
-                    "Scan Error",
-                    f"An error occurred while scanning:\n\n{str(e)}\n\nPlease check that your game directory is correct and accessible."
-                )
-            self.after(0, _show_error)
+        self.update_location_dropdown()
+        self.refresh_tracks()
+        self.update_idletasks()
 
     def update_location_dropdown(self):
         """Update location dropdown based on scanned tracks"""
@@ -1574,11 +1572,6 @@ class VTMBPlaylistMakerApp(ctk.CTk):
 
         # Update dropdown values
         self.location_dropdown.configure(values=sorted_locations)
-
-        # Reset to "All Locations" if current value is not in the new list
-        current_value = self.location_var.get()
-        if current_value not in sorted_locations:
-            self.location_var.set("All Locations")
 
     def on_location_change(self, choice):
         """Handle location dropdown change"""
@@ -1630,13 +1623,8 @@ class VTMBPlaylistMakerApp(ctk.CTk):
                 if not t['info'] or not t['info'].get('artist')
             ]
 
-        # Then apply location filter
-        if selected_location != "All Locations" and selected_filter == "📍 By Location":
-            filtered_tracks = [
-                t for t in filtered_tracks
-                if t['info'] and t['info'].get('location') == selected_location
-            ]
-        elif selected_location != "All Locations" and selected_filter == "All Tracks":
+        # Then apply location filter (always, regardless of track type filter)
+        if selected_location != "All Locations":
             filtered_tracks = [
                 t for t in filtered_tracks
                 if t['info'] and t['info'].get('location') == selected_location
@@ -1738,6 +1726,13 @@ class VTMBPlaylistMakerApp(ctk.CTk):
                 # Display tracks in this category
                 for track in tracks_by_type[track_type]:
                     self.create_track_card(track)
+
+        # Force scrollable frame to update and show content
+        self.tracks_container.update_idletasks()
+        try:
+            self.tracks_container._parent_canvas.yview_moveto(0)
+        except Exception:
+            pass
 
     def display_malkavian_whispers(self):
         """Display Malkavian whisper management interface"""
@@ -2133,7 +2128,7 @@ class VTMBPlaylistMakerApp(ctk.CTk):
                     try:
                         sound = pygame.mixer.Sound(track['full_path'])
                         self.track_duration_cache[track['full_path']] = sound.get_length()
-                    except:
+                    except Exception:
                         self.track_duration_cache[track['full_path']] = 0.0
                 self.current_track_duration = self.track_duration_cache.get(track['full_path'], 0.0)
 
@@ -2320,7 +2315,7 @@ class VTMBPlaylistMakerApp(ctk.CTk):
                     try:
                         sound = pygame.mixer.Sound(whisper.audio_path)
                         self.track_duration_cache[whisper.audio_path] = sound.get_length()
-                    except:
+                    except Exception:
                         self.track_duration_cache[whisper.audio_path] = 0.0
                 self.current_track_duration = self.track_duration_cache.get(whisper.audio_path, 0.0)
 
@@ -2933,9 +2928,25 @@ class VTMBPlaylistMakerApp(ctk.CTk):
                 self.radio_segment_manager.set_game_directory(path)
                 self.whisper_manager.set_game_directory(path)
                 self.save_config()
-                messagebox.showinfo("Success",
-                                  "Game directory configured!\n\n"
-                                  "Next step: Create a backup before making any changes.")
+
+                # Offer to backup before making any changes
+                if messagebox.askyesno(
+                    "Create Backup?",
+                    "Game directory configured!\n\n"
+                    "It's highly recommended to backup your game's audio files "
+                    "before making any changes.\n\n"
+                    "Create a backup now?"
+                ):
+                    success, msg = self.game_manager.backup_all_audio_files()
+                    if success:
+                        self.config.last_backup_time = msg
+                        self.save_config()
+                        messagebox.showinfo("Backup Complete", msg)
+                    else:
+                        messagebox.showwarning("Backup Issue", msg)
+
+                # Auto-scan after first-time setup
+                self.after(300, self.scan_game_tracks)
         else:
             message = "Could not auto-detect VTMB installation.\n\n"
             message += "Please manually set the game directory in Settings.\n\n"
@@ -3128,6 +3139,7 @@ class SettingsDialog(ctk.CTkToplevel):
         self.grab_set()
 
         self.setup_ui()
+        finalize_modal(self, min_width=500, min_height=350)
 
     def setup_ui(self):
         main_frame = ctk.CTkFrame(self, fg_color=self.colors['bg_dark'])
@@ -3286,6 +3298,7 @@ class BackupSelectionDialog(ctk.CTkToplevel):
         self.grab_set()
 
         self.setup_ui()
+        finalize_modal(self, min_width=500, min_height=350)
 
     def setup_ui(self):
         main_frame = ctk.CTkFrame(self, fg_color=self.colors['bg_dark'])
@@ -3377,7 +3390,7 @@ class ScanProgressDialog(ctk.CTkToplevel):
             'text_dim': '#B88888',
         }
 
-        self.title("Scanning Game Files - Please wait until it's finished")
+        self.title("Scanning Game Files")
         self.geometry("360x140")
         self.configure(fg_color=self.colors['bg_medium'])
         apply_app_icon(self)
@@ -3428,25 +3441,21 @@ class ScanProgressDialog(ctk.CTkToplevel):
         self.update_idletasks()
 
     def update_status(self, text: str):
-        """Thread-safe status message update"""
-        def _update():
-            if not self.winfo_exists():
-                return
-            self.status_label.configure(text=text)
-            self.update_idletasks()
-        self.after(0, _update)
+        """Update status message shown in the dialog"""
+        if not self.winfo_exists():
+            return
+        self.status_label.configure(text=text)
+        self.update_idletasks()
 
     def close(self):
-        """Thread-safe dialog termination"""
-        def _close():
-            if not self.winfo_exists():
-                return
-            try:
-                self.progress_bar.stop()
-            except Exception:
-                pass
-            self.destroy()
-        self.after(0, _close)
+        """Terminate the dialog"""
+        if not self.winfo_exists():
+            return
+        try:
+            self.progress_bar.stop()
+        except Exception:
+            pass
+        self.destroy()
 
 
 class WhisperSubtitleDialog(ctk.CTkToplevel):
@@ -3731,7 +3740,7 @@ class ProgressDialog(ctk.CTkToplevel):
                             playlist.game_file_path
                         )
 
-                    success, error_msg = self.audio_processor.create_playlist_audio(
+                    success = self.audio_processor.create_playlist_audio(
                         playlist,
                         temp_file,
                         original_file_path=original_file_path
@@ -3753,8 +3762,6 @@ class ProgressDialog(ctk.CTkToplevel):
                             failed_count += 1
                     else:
                         self.log(f"✗ Failed to generate audio for {playlist.name}")
-                        if error_msg:
-                            self.log(f"  Error: {error_msg}")
                         failed_count += 1
                 finally:
                     try:
@@ -3878,7 +3885,7 @@ class ProgressDialog(ctk.CTkToplevel):
                     backup_loop_path = game_loop_path
                     self.log(f"  WARNING: No backup found - using current game file (may already be modified)")
 
-                success, error_msg = self.audio_processor.create_playlist_audio(
+                success = self.audio_processor.create_playlist_audio(
                     playlist,
                     temp_segment_file,
                     original_file_path=backup_loop_path
@@ -3886,8 +3893,6 @@ class ProgressDialog(ctk.CTkToplevel):
 
                 if not success:
                     self.log(f"  ✗ Failed to create segment audio")
-                    if error_msg:
-                        self.log(f"    Error: {error_msg}")
                     return False
 
                 # Load the replacement segment
@@ -3916,7 +3921,7 @@ class ProgressDialog(ctk.CTkToplevel):
                             other_temp_file = other_tmp.name
 
                         try:
-                            other_success, other_error_msg = self.audio_processor.create_playlist_audio(
+                            other_success = self.audio_processor.create_playlist_audio(
                                 other_pl,
                                 other_temp_file,
                                 original_file_path=backup_loop_path
@@ -3926,10 +3931,6 @@ class ProgressDialog(ctk.CTkToplevel):
                                 other_replacement = PyDubSegment.from_file(other_temp_file)
                                 replacements[other_segment.unique_id] = other_replacement
                                 self.log(f"    Added to replacements: {len(other_replacement)/1000:.1f}s")
-                            else:
-                                self.log(f"    Warning: Could not generate audio for other segment")
-                                if other_error_msg:
-                                    self.log(f"      Error: {other_error_msg}")
                         finally:
                             try:
                                 os.remove(other_temp_file)

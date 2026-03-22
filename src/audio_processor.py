@@ -2,6 +2,8 @@
 Audio processing module for creating and managing playlists
 """
 import os
+import shutil
+import subprocess
 import sys
 import random
 from typing import List, Tuple
@@ -11,11 +13,14 @@ from src.models import AudioFile, Playlist, PlaybackMode
 from src.utils import SUPPORTED_AUDIO_FORMATS
 
 
+# Module-level FFmpeg availability flag
+_ffmpeg_available = None
+
+
 def get_ffmpeg_path():
     """
     Get the path to FFmpeg executable.
     Handles both development and bundled (PyInstaller) environments.
-    Returns tuple: (ffmpeg_path or None, error_message or None)
     """
     # Check if we're running as a bundled executable
     if getattr(sys, 'frozen', False):
@@ -35,57 +40,54 @@ def get_ffmpeg_path():
             AudioSegment.converter = ffmpeg_path
             AudioSegment.ffmpeg = ffmpeg_path
             AudioSegment.ffprobe = ffprobe_path
-            return ffmpeg_path, None
-        else:
-            return None, f"FFMPEG not found in bundle at: {ffmpeg_path}"
+            return ffmpeg_path
 
-    # Running in development mode - check if FFmpeg is in PATH
-    import shutil
-    ffmpeg_in_path = shutil.which('ffmpeg')
-    if ffmpeg_in_path:
-        return ffmpeg_in_path, None
-    else:
-        return None, "FFMPEG not found in system PATH. Please install FFMPEG or ensure it's in your PATH."
+    # Running in development mode or FFmpeg is in PATH
+    # AudioSegment will use system FFmpeg
+    return None
 
 
-def validate_ffmpeg():
-    """
-    Validate that FFMPEG is available and working.
-    Returns tuple: (is_valid: bool, error_message: str or None)
-    """
-    ffmpeg_path, error = get_ffmpeg_path()
+def check_ffmpeg_available():
+    """Check if FFmpeg is actually callable. Returns (available, message)."""
+    global _ffmpeg_available
 
-    if error:
-        return False, error
+    # Use the converter path pydub will use
+    ffmpeg_cmd = getattr(AudioSegment, 'converter', None) or shutil.which('ffmpeg')
+    if not ffmpeg_cmd:
+        _ffmpeg_available = False
+        return False, (
+            "FFmpeg not found. It may be missing from the installation or blocked by your antivirus.\n"
+            "Audio processing features require FFmpeg to work."
+        )
 
-    # Try to verify FFMPEG works by checking version
     try:
-        import subprocess
-        if ffmpeg_path:
-            result = subprocess.run([ffmpeg_path, '-version'],
-                                  capture_output=True,
-                                  timeout=5,
-                                  creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
-            if result.returncode == 0:
-                return True, None
-            else:
-                return False, f"FFMPEG found but not working properly (exit code: {result.returncode})"
+        result = subprocess.run(
+            [ffmpeg_cmd, '-version'],
+            capture_output=True, timeout=10
+        )
+        _ffmpeg_available = result.returncode == 0
+        if _ffmpeg_available:
+            return True, "FFmpeg is available"
         else:
-            # No explicit path, try system ffmpeg
-            result = subprocess.run(['ffmpeg', '-version'],
-                                  capture_output=True,
-                                  timeout=5,
-                                  creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
-            if result.returncode == 0:
-                return True, None
-            else:
-                return False, f"FFMPEG found in PATH but not working properly"
+            return False, "FFmpeg was found but returned an error when tested."
     except FileNotFoundError:
-        return False, "FFMPEG executable not found. Please install FFMPEG."
-    except subprocess.TimeoutExpired:
-        return False, "FFMPEG validation timed out."
+        _ffmpeg_available = False
+        return False, (
+            "FFmpeg not found. It may be missing from the installation or blocked by your antivirus.\n"
+            "Audio processing features require FFmpeg to work."
+        )
     except Exception as e:
-        return False, f"Error validating FFMPEG: {str(e)}"
+        _ffmpeg_available = False
+        return False, f"FFmpeg check failed: {e}"
+
+
+def is_ffmpeg_available():
+    """Return cached FFmpeg availability status."""
+    global _ffmpeg_available
+    if _ffmpeg_available is None:
+        available, _ = check_ffmpeg_available()
+        return available
+    return _ffmpeg_available
 
 
 # Initialize FFmpeg path on module load
@@ -113,7 +115,7 @@ class AudioProcessor:
         return ext in self.supported_formats
 
     def create_playlist_audio(self, playlist: Playlist, output_path: str,
-                            target_duration: int = None, original_file_path: str = None):
+                            target_duration: int = None, original_file_path: str = None) -> bool:
         """
         Create a single audio file from playlist
 
@@ -124,12 +126,11 @@ class AudioProcessor:
             original_file_path: Path to original game file to match audio properties
 
         Returns:
-            Tuple of (success: bool, error_message: str or None)
+            True if successful, False otherwise
         """
         if not playlist.audio_files:
-            error_msg = f"Playlist '{playlist.name}' has no audio files"
-            print(error_msg)
-            return False, error_msg
+            print(f"Playlist '{playlist.name}' has no audio files")
+            return False
 
         try:
             # Prepare audio segments and normalize sample rates
@@ -206,9 +207,8 @@ class AudioProcessor:
                     continue
 
             if not audio_segments:
-                error_msg = "No valid audio files to process - all files failed to load"
-                print(error_msg)
-                return False, error_msg
+                print("No valid audio files to process")
+                return False
 
             # Generate playlist based on playback mode
             final_audio = self._generate_audio_sequence(
@@ -239,17 +239,13 @@ class AudioProcessor:
             final_audio.export(output_path, **export_params)
             print(f"Successfully created: {output_path}")
 
-            return True, None
+            return True
 
         except Exception as e:
-            error_msg = f"Error creating playlist audio: {str(e)}"
-            print(error_msg)
+            print(f"Error creating playlist audio: {e}")
             import traceback
             traceback.print_exc()
-            # Check if it's an FFMPEG-related error
-            if 'ffmpeg' in str(e).lower() or 'ffprobe' in str(e).lower():
-                error_msg += "\n\nThis appears to be an FFMPEG-related error. Please ensure FFMPEG is properly installed and bundled."
-            return False, error_msg
+            return False
 
     def _generate_audio_sequence(self, segments: List[AudioSegment],
                                  playback_mode: str,
@@ -346,12 +342,64 @@ class AudioProcessor:
         if not self.is_supported_format(filepath):
             return False, f"Unsupported format. Supported: {', '.join(self.supported_formats)}"
 
+        if not is_ffmpeg_available():
+            return False, (
+                "FFmpeg is not available. It may be missing from the installation "
+                "or blocked by your antivirus software.\n"
+                "Audio files cannot be validated without FFmpeg."
+            )
+
+        _, ext = os.path.splitext(filepath.lower())
+        format_hint = ext[1:] if ext else None
+
+        # First attempt: let pydub auto-detect
         try:
-            # Try to load the file
             AudioSegment.from_file(filepath)
             return True, ""
-        except Exception as e:
-            return False, f"Invalid audio file: {str(e)}"
+        except Exception:
+            pass
+
+        # Second attempt: try with explicit format hint (helps with
+        # mislabeled or oddly-encoded files from YouTube converters)
+        if format_hint:
+            try:
+                AudioSegment.from_file(filepath, format=format_hint)
+                return True, ""
+            except Exception:
+                pass
+
+        # Third attempt: try converting via raw ffmpeg to a temp WAV
+        try:
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
+                tmp_path = tmp.name
+            try:
+                ffmpeg_cmd = getattr(AudioSegment, 'converter', None) or 'ffmpeg'
+                result = subprocess.run(
+                    [ffmpeg_cmd, '-y', '-i', filepath, '-f', 'wav', tmp_path],
+                    capture_output=True, timeout=30
+                )
+                if result.returncode == 0 and os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 0:
+                    AudioSegment.from_file(tmp_path)
+                    return True, ""
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+        except FileNotFoundError:
+            return False, (
+                "FFmpeg is not available. It may be missing from the installation "
+                "or blocked by your antivirus software."
+            )
+        except Exception:
+            pass
+
+        return False, (
+            "This audio file could not be loaded. It may be corrupted or use an "
+            "unsupported codec.\nTry converting it to WAV format using a free tool "
+            "like Convertio.co, then add the converted file."
+        )
 
     def get_audio_info(self, filepath: str) -> dict:
         """Get detailed information about an audio file"""
