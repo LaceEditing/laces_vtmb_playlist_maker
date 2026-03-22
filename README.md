@@ -1,4 +1,4 @@
-# VTMB Playlist Maker 🎵
+# VTMB Playlist Maker
 
 A modern, user-friendly tool for creating custom music playlists for **Vampire: The Masquerade - Bloodlines**. Replace in-game music with your own tracks while maintaining automatic backup and restore capabilities.
 
